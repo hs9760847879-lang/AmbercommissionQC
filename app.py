@@ -9,28 +9,37 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from groq import Groq
 
+# Load environment variables
 load_dotenv()
 
 FRESHDESK_API_KEY = os.getenv("FRESHDESK_API_KEY")
 FRESHDESK_DOMAIN = os.getenv("FRESHDESK_DOMAIN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+if not FRESHDESK_API_KEY or not GROQ_API_KEY:
+    raise ValueError("❌ Missing API keys in the .env file!")
+
+# Setup Groq Client
 groq_client = Groq(api_key=GROQ_API_KEY)
 app = Flask(__name__)
 
+# Freshdesk API Setup
 BASE_URL = f"https://{FRESHDESK_DOMAIN}.freshdesk.com/api/v2"
 AUTH = (FRESHDESK_API_KEY, "X")
 
 # --- HELPER FUNCTIONS ---
 
 def clean_html(raw_html):
-    if not raw_html: return ""
+    """Remove HTML tags and normalize spaces"""
+    if not raw_html: 
+        return ""
     cleanr = re.compile('<.*?>')
     cleantext = re.sub(cleanr, ' ', raw_html)
     cleantext = html.unescape(cleantext)
     return re.sub(r'\s+', ' ', cleantext).strip()
 
 def extract_pdf_text(attachment_url):
+    """Downloads a PDF from Freshdesk and extracts its text"""
     try:
         resp = requests.get(attachment_url, auth=AUTH, timeout=15)
         if resp.status_code == 200:
@@ -43,6 +52,7 @@ def extract_pdf_text(attachment_url):
     return ""
 
 def extract_with_ai(combined_text):
+    """Uses Groq AI to extract context"""
     prompt = f"""
     You are a strict data extraction assistant. Analyze the Freshdesk ticket emails and PDF contents below.
     DO NOT calculate any math. DO NOT confuse Academic Years with Move-in dates.
@@ -92,6 +102,7 @@ def standardize_date(value):
 # --- QC LOGIC ---
 
 def perform_qc(sheet_data, freshdesk_data):
+    """Compares Sheet data vs AI Extracted data"""
     notes = []
     status = "✅ PASS"
 
@@ -102,7 +113,7 @@ def perform_qc(sheet_data, freshdesk_data):
         if abs(sheet_val - fd_val) > 0.1: 
             notes.append(f"Commission Mismatch (Sheet: {sheet_val}, FD: {fd_val})")
             status = "❌ FAIL"
-    elif fd_val is None:
+    elif fd_val is None and sheet_val is not None:
         status = "⚠️ MANUAL REVIEW"
         notes.append("Commission not found in Freshdesk")
 
@@ -150,52 +161,77 @@ def perform_qc(sheet_data, freshdesk_data):
         notes.append("All fields match perfectly")
 
     return status, "; ".join(notes)
+
+# --- FLASK ROUTES ---
+
 @app.route('/', methods=['GET'])
 def wake_up():
+    """Route for Render cold-start ping"""
     return "Server is awake and ready!", 200
-# --- FLASK ROUTE ---
 
 @app.route('/qc', methods=['POST'])
 def handle_qc():
     data = request.json
-    ticket_url = data.get("freshdesk_ticket_url", "")
+    raw_urls = data.get("freshdesk_ticket_url", "")
     
-    # 1. Extract Ticket ID
+    # 1. Parse the list of URLs from Google Sheets (e.g., '["url1", "url2"]')
     try:
-        ticket_id = ticket_url.strip().split('/')[-1]
-        int(ticket_id)
+        urls_list = json.loads(raw_urls)
+        if not isinstance(urls_list, list):
+            urls_list = [urls_list]
     except:
-        return jsonify({"error": "Invalid Ticket URL"}), 400
+        # If it's not a JSON array, treat it as a single string URL
+        urls_list = [raw_urls] if raw_urls else []
 
-    # 2. Fetch Freshdesk Data
-    try:
-        ticket_resp = requests.get(f"{BASE_URL}/tickets/{ticket_id}", auth=AUTH, timeout=15)
-        if ticket_resp.status_code != 200:
-            return jsonify({"error": f"Freshdesk Error {ticket_resp.status_code}"}), 400
-        ticket_data = ticket_resp.json()
-        
-        combined_text = f"[Main Ticket Email - Date: {ticket_data.get('created_at', '')}]\n{clean_html(ticket_data.get('description', ''))}\n\n"
-        
-        # Get Main Attachments
-        for att in ticket_data.get("attachments", []):
-            if "pdf" in att.get("content_type", "").lower() or att.get("name", "").lower().endswith(".pdf"):
-                combined_text += f"[PDF: {att['name']}]\n{extract_pdf_text(att['attachment_url'])}\n\n"
+    if not urls_list:
+        return jsonify({"error": "No Freshdesk links provided"}), 400
 
-        # Get Conversations
-        conv_resp = requests.get(f"{BASE_URL}/tickets/{ticket_id}/conversations", auth=AUTH, timeout=15)
-        if conv_resp.status_code == 200:
-            for conv in conv_resp.json():
-                combined_text += f"[Conversation Email - Date: {conv.get('created_at', '')}]\n{clean_html(conv.get('body', ''))}\n\n"
-                for att in conv.get("attachments", []):
-                    if "pdf" in att.get("content_type", "").lower() or att.get("name", "").lower().endswith(".pdf"):
-                        combined_text += f"[PDF: {att['name']}]\n{extract_pdf_text(att['attachment_url'])}\n\n"
-    except Exception as e:
-        return jsonify({"error": f"API Fetch Failed: {str(e)}"}), 500
+    combined_text = ""
 
-    # 3. AI Extraction
+    # 2. Loop through ALL tickets in the list to combine their data
+    for ticket_url in urls_list:
+        try:
+            # Extract Ticket ID safely (handle trailing slashes)
+            ticket_id = ticket_url.strip('/').split('/')[-1]
+            int(ticket_id) # Validate it's a number
+        except:
+            continue # Skip invalid URLs in the list
+
+        try:
+            # Fetch Ticket Description
+            ticket_resp = requests.get(f"{BASE_URL}/tickets/{ticket_id}", auth=AUTH, timeout=15)
+            if ticket_resp.status_code != 200:
+                continue # Skip if ticket fails to load
+            
+            ticket_data = ticket_resp.json()
+            combined_text += f"\n\n=== TICKET ID: {ticket_id} ===\n"
+            combined_text += f"[Main Ticket Email - Date: {ticket_data.get('created_at', '')}]\n{clean_html(ticket_data.get('description', ''))}\n\n"
+            
+            # Get Main Ticket Attachments
+            for att in ticket_data.get("attachments", []):
+                if "pdf" in att.get("content_type", "").lower() or att.get("name", "").lower().endswith(".pdf"):
+                    combined_text += f"[PDF: {att['name']}]\n{extract_pdf_text(att['attachment_url'])}\n\n"
+
+            # Get Conversations
+            conv_resp = requests.get(f"{BASE_URL}/tickets/{ticket_id}/conversations", auth=AUTH, timeout=15)
+            if conv_resp.status_code == 200:
+                for conv in conv_resp.json():
+                    combined_text += f"[Conversation Email - Date: {conv.get('created_at', '')}]\n{clean_html(conv.get('body', ''))}\n\n"
+                    for att in conv.get("attachments", []):
+                        if "pdf" in att.get("content_type", "").lower() or att.get("name", "").lower().endswith(".pdf"):
+                            combined_text += f"[PDF: {att['name']}]\n{extract_pdf_text(att['attachment_url'])}\n\n"
+                            
+        except Exception as e:
+            print(f"Error fetching ticket {ticket_id}: {e}")
+
+    # 3. If no text was gathered from any ticket
+    if not combined_text.strip():
+        return jsonify({"error": "Could not fetch data from any provided Freshdesk links"}), 400
+
+    # 4. AI Extraction (Now processes combined text from ALL tickets)
     ai_data = extract_with_ai(combined_text)
 
-    # 4. QC Comparison
+    # 5. QC Comparison
     sheet_data_for_qc = {
         "commission_value": data.get("sheet_commission_value"),
         "min_lease": data.get("sheet_min_lease"),
@@ -207,7 +243,7 @@ def handle_qc():
 
     qc_status, qc_notes = perform_qc(sheet_data_for_qc, ai_data)
 
-    # 5. Format Response for Google Sheets
+    # 6. Format Response for Google Sheets
     response_data = {
         "qc_timestamp": data.get("current_time", ""),
         "commission_id": data.get("commission_id", ""),
@@ -228,7 +264,7 @@ def handle_qc():
         "freshdesk_start_date": ai_data.get("start_date", "Not Found"),
         "qc_status": qc_status,
         "qc_notes": qc_notes,
-        "freshdesk_ticket_url": ticket_url
+        "freshdesk_ticket_url": raw_urls
     }
 
     return jsonify(response_data), 200
