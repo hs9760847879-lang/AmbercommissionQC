@@ -114,7 +114,6 @@ def extract_with_ai_chunked(combined_text):
             if val and val != "Not Found" and str(val) not in merged_data[key]:
                 merged_data[key].append(str(val))
         
-        # FIX: Reduced sleep from 4 to 2 seconds to avoid Render 30s timeouts
         if i < len(chunks) - 1:
             time.sleep(2) 
 
@@ -135,7 +134,9 @@ def extract_number(value):
 def standardize_date(value):
     if not value or value == "Not Found": return None
     try:
-        return dateutil.parser.parse(str(value))
+        dt = dateutil.parser.parse(str(value))
+        # FIX: Remove timezone info so Python can compare them without crashing
+        return dt.replace(tzinfo=None)
     except:
         return None
 
@@ -203,7 +204,6 @@ def wake_up():
 
 @app.route('/qc', methods=['POST'])
 def handle_qc():
-    # FIX: Global Try/Except to catch crashes and return the actual error to Google Sheets
     try:
         data = request.get_json(force=True)
         raw_urls = data.get("freshdesk_ticket_url", "")
@@ -293,7 +293,6 @@ def handle_qc():
         return jsonify(response_data), 200
 
     except Exception as e:
-        # If the script crashes for ANY reason, catch it and return the real error to the Google Sheet
         print(f"CRITICAL ERROR: {e}")
         return jsonify({"error": f"Python Script Crash: {str(e)}"}), 500
 
